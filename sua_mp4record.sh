@@ -74,17 +74,27 @@ TZ_DUNG="UTC0"          # the TZ mp4record must run with
 TZ="$TZ_DUNG"
 export TZ
 
-# Print "<pid> <TZ>" for every running mp4record
+# Print "<pid> <TZ>" for every running mp4record.
+#
+# Shortlist with one `ps` first. Walking all of /proc instead forks `tr` once
+# per process - about 60 forks on an idle camera, which measured 2 seconds per
+# call. That is fine every 5 minutes and wasteful every minute.
+#
+# `ps | grep` alone is NOT enough to decide: a `wget` fetching
+# service.sh?name=mp4record&action=start has "mp4record" in its own command
+# line and would be counted as a recorder. So each candidate is still confirmed
+# against /proc/<pid>/cmdline - just for the two or three that ps shortlisted.
 liet_ke() {
-    for p in /proc/[0-9]*; do
+    for pid in $(ps 2>/dev/null | grep '[m]p4record' | awk '{print $1}'); do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
         # The redirect must be inside the braces: when a process exits between
-        # the glob and the read, it is the SHELL that reports "can't open
+        # the listing and the read, it is the SHELL that reports "can't open
         # /proc/N/cmdline", so 2>/dev/null on tr alone does not silence it.
-        c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null )
+        c=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null )
         case "$c" in
             "./mp4record"*)
-                tz=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | grep '^TZ=' | cut -d= -f2- )
-                echo "${p#/proc/} ${tz:-NO_TZ}"
+                tz=$( { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | grep '^TZ=' | cut -d= -f2- )
+                echo "$pid ${tz:-NO_TZ}"
                 ;;
         esac
     done
