@@ -22,13 +22,33 @@ STARTUP_REMOTE = "/tmp/sd/yi-hack/startup.sh"
 CALL_LINE = "/bin/sh /tmp/sd/yi-hack/scripts/sua_mp4record.sh >/dev/null 2>&1 &\n"
 CRON_LINE = "*/5 * * * * /bin/sh /tmp/sd/yi-hack/scripts/sua_mp4record.sh --canh >/dev/null 2>&1"
 
+# Deliberately one long line: a "|| \" continuation here is easy to mangle when
+# this block is written out through another tool, and a literal "\n" in the
+# middle silently breaks the registration - the cron job then quietly stops
+# coming back after a reboot, because /var/spool is tmpfs.
 CRON_BLOCK = (
     "\n# Keep exactly one mp4record with the right TZ (watch_process and the\n"
     "# camera_settings.sh CGI can start extra copies - see README).\n"
     "mkdir -p /var/spool/cron/crontabs\n"
-    "grep -q 'sua_mp4record.sh --canh' /var/spool/cron/crontabs/root 2>/dev/null || \\\n"
-    f"    echo '{CRON_LINE}' >> /var/spool/cron/crontabs/root\n"
+    f"grep -q 'sua_mp4record.sh --canh' /var/spool/cron/crontabs/root 2>/dev/null"
+    f" || echo '{CRON_LINE}' >> /var/spool/cron/crontabs/root\n"
 )
+
+# See "Pitfall 3" in the README. Only applied if the gdrive add-on is present.
+GDRIVE_TZ_LINE = "GDRIVE_TZ=$(cat /home/yi-hack/etc/TZ 2>/dev/null)\n"
+
+
+def patch_gdrive_lines(text):
+    """Give GDriveUploader/Autoremover the same clock the folder names use."""
+    if "gdrive/GDriveUploader" not in text or "GDRIVE_TZ" in text:
+        return text, False
+    for name in ("GDriveUploader", "GDriveAutoremover"):
+        old = f"sh /tmp/sd/yi-hack/gdrive/{name}"
+        new = f'TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/{name}'
+        if old in text and new not in text:
+            text = text.replace(old, new, 1)
+    anchor = 'TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/GDriveUploader'
+    return text.replace(anchor, GDRIVE_TZ_LINE + anchor, 1), True
 
 
 def deploy(ip):
@@ -90,6 +110,12 @@ def deploy(ip):
     if "--canh" not in new:
         new += CRON_BLOCK
         print("  added the cron registration to startup.sh.")
+
+    new, gdrive_patched = patch_gdrive_lines(new)
+    if gdrive_patched:
+        print("  gdrive add-on found: gave the uploader your local timezone.")
+        print("     !! start_time/finish_time in GDriveUploader now mean LOCAL")
+        print("        time, not UTC. Check your upload window - see README.")
 
     if new != existing:
         with sftp.open(STARTUP_REMOTE, "w") as f:

@@ -121,6 +121,44 @@ If it prints `UTC`, you are fine. If it prints a local zone, remove
 `/etc/TZ` and `/etc/localtime` (back them up first) or your OSD will be off
 by one extra offset. The installer asks you about this.
 
+## Pitfall 3: the Google Drive uploader now runs 7 hours late
+
+Only relevant if you use roleoroleo's Google Drive add-on
+(`/tmp/sd/yi-hack/gdrive/`).
+
+`GDriveUploader` converts folder names back into timestamps with `date -d`,
+which uses the system clock — and the system clock is UTC. Once folder names
+carry local time, every folder looks like it is in the future, so the uploader
+waits one full UTC offset before rolling over to the next hour. Uploads end up
+running permanently that far behind. Nothing is lost; it just lags.
+
+Give the uploader the same clock the folder names use, in
+`/tmp/sd/yi-hack/startup.sh`:
+
+```sh
+GDRIVE_TZ=$(cat /home/yi-hack/etc/TZ 2>/dev/null)
+TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/GDriveUploader
+TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/GDriveAutoremover
+```
+
+`restart_gdrive.sh` applies this to a running camera without a reboot.
+
+Three things to know before you do:
+
+- **`start_time` / `finish_time`** near the top of `GDriveUploader` are read in
+  whatever clock the process has. If you set an upload window it now means
+  local time rather than UTC — a `01:00`–`07:00` window that was really running
+  08:00–14:00 local moves to 01:00–07:00 local. Check it is still what you want.
+- **`get_next_dir()` only moves forward** (`[ "$current_dir" \< "$n" ]`). If the
+  pointer in `gdrive_folder.index` ever gets ahead of your real folders — a
+  clock experiment, a renamed directory — every hour in between is skipped
+  permanently. `restart_gdrive.sh <FOLDER> <DRIVE_DIR_ID>` rewinds it.
+- **Launch it with the right environment.** `system.sh` (lines 53-54) puts the
+  bundled `curl` on `PATH` and its libraries on `LD_LIBRARY_PATH` before it
+  calls `startup.sh`. Start the uploader from a bare SSH session without them
+  and every upload fails with `libssl.so.1.1: cannot open shared object file`,
+  logged quietly to `log/GDriveUploader.log` while the process keeps looping.
+
 ## Install
 
 Requires Python 3 and `paramiko` on your PC (`pip install paramiko`), and SSH

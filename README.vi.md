@@ -117,6 +117,45 @@ Ra `UTC` là đúng. Ra giờ địa phương thì phải gỡ `/etc/TZ` và `/e
 (nhớ sao lưu), nếu không OSD sẽ lệch thêm một lần offset nữa. Script cài đặt sẽ
 hỏi bạn việc này.
 
+## Bẫy 3: bản upload Google Drive chậm hẳn 7 tiếng
+
+Chỉ liên quan nếu bạn dùng add-on Google Drive của roleoroleo
+(`/tmp/sd/yi-hack/gdrive/`).
+
+`GDriveUploader` đổi tên thư mục ngược lại thành mốc thời gian bằng `date -d`,
+mà `date` lấy theo đồng hồ hệ thống — vốn là UTC. Từ khi tên thư mục mang giờ
+địa phương, nó nhìn thư mục nào cũng thấy nằm ở tương lai, nên chờ đủ một lần
+offset múi giờ mới chuyển sang giờ kế tiếp. Kết quả là upload luôn chậm đúng
+bằng offset đó. Không mất dữ liệu, chỉ trễ.
+
+Cho uploader dùng chung đồng hồ với tên thư mục, trong
+`/tmp/sd/yi-hack/startup.sh`:
+
+```sh
+GDRIVE_TZ=$(cat /home/yi-hack/etc/TZ 2>/dev/null)
+TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/GDriveUploader
+TZ="$GDRIVE_TZ" sh /tmp/sd/yi-hack/gdrive/GDriveAutoremover
+```
+
+`restart_gdrive.sh` áp dụng ngay cho camera đang chạy, không cần reboot.
+
+Ba điều phải biết trước khi làm:
+
+- **`start_time` / `finish_time`** ở đầu file `GDriveUploader` được đọc theo
+  đồng hồ mà tiến trình đang có. Nếu bạn có đặt khung giờ upload thì từ nay nó
+  mang nghĩa giờ địa phương chứ không phải UTC — khung `01:00`–`07:00` vốn đang
+  chạy thật vào 08:00–14:00 giờ địa phương sẽ dời về đúng 01:00–07:00. Kiểm tra
+  lại xem còn đúng ý bạn không.
+- **`get_next_dir()` chỉ đi tới** (`[ "$current_dir" \< "$n" ]`). Nếu con trỏ
+  trong `gdrive_folder.index` lỡ vượt lên trước các thư mục thật — do thử
+  nghiệm đồng hồ, do đổi tên thư mục — thì mọi giờ ở giữa bị bỏ qua vĩnh viễn.
+  Dùng `restart_gdrive.sh <THU_MUC> <ID_DRIVE>` để kéo con trỏ lùi lại.
+- **Phải khởi động với đúng biến môi trường.** `system.sh` (dòng 53-54) đưa
+  `curl` đi kèm vào `PATH` và thư viện của nó vào `LD_LIBRARY_PATH` trước khi
+  gọi `startup.sh`. Nếu bạn chạy uploader từ một phiên SSH trắng, mọi lần upload
+  đều hỏng với `libssl.so.1.1: cannot open shared object file` — ghi lặng lẽ vào
+  `log/GDriveUploader.log` trong khi tiến trình vẫn quay vòng như không có gì.
+
 ## Cài đặt
 
 Cần Python 3 và `paramiko` trên PC (`pip install paramiko`), và camera đã bật

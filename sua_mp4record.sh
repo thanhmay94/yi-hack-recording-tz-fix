@@ -77,10 +77,13 @@ export TZ
 # Print "<pid> <TZ>" for every running mp4record
 liet_ke() {
     for p in /proc/[0-9]*; do
-        c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+        # The redirect must be inside the braces: when a process exits between
+        # the glob and the read, it is the SHELL that reports "can't open
+        # /proc/N/cmdline", so 2>/dev/null on tr alone does not silence it.
+        c=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null )
         case "$c" in
             "./mp4record"*)
-                tz=$(tr '\0' '\n' < "$p/environ" 2>/dev/null | grep '^TZ=' | cut -d= -f2-)
+                tz=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | grep '^TZ=' | cut -d= -f2- )
                 echo "${p#/proc/} ${tz:-NO_TZ}"
                 ;;
         esac
