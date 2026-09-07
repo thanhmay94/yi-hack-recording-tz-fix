@@ -1,0 +1,173 @@
+# yi-hack recording folder timezone fix
+
+On Yi cameras running [yi-hack-MStar](https://github.com/roleoroleo/yi-hack-MStar),
+recordings are stored as `/tmp/sd/record/<YYYY>Y<MM>M<DD>D<HH>H/<MM>M<SS>S.mp4`.
+The **folder names come out in UTC** while the timestamp burned into the video
+is in local time. Anything that derives the recording time from the folder name
+is therefore off by your UTC offset.
+
+This repo explains why, and fixes it without touching the on-screen timestamp.
+
+Also documented here: a second failure mode that produces **truncated .mp4
+files which look exactly like failing camera hardware** but are not.
+
+*[Tiếng Việt](README.vi.md)*
+
+## Two clocks
+
+This is the key to the whole thing. Two different times are derived from two
+different sources that happen to share one offset:
+
+```
+On-screen timestamp (OSD) = system timezone (/etc/localtime) + tz_offset_osd
+Recording folder name     = mp4record's own TZ env var       + tz_offset_osd
+```
+
+`tz_offset_osd` is an integer (seconds) written into the shared memory file
+`/tmp/mmap.info`, at address `0x4F4` for model `y203c` (see
+[`set_tz_offset.c`](https://github.com/roleoroleo/yi-hack-MStar/blob/master/src/set_tz_offset/set_tz_offset/set_tz_offset.c)
+for the per-model address table). `system.sh` sets it to your UTC offset on
+every boot. It lives in `/tmp` (tmpfs), so it does not survive a reboot.
+
+## The bug
+
+`system.sh` launches `mp4record` like this:
+
+```sh
+export TZP=`TZ=$TZ_TMP date +%z`      # "+0700"
+export TZP=${TZP:0:3}:${TZP:3:2}      # "+07:00"
+export TZ=GMT$TZP                     # "GMT+07:00"
+./mp4record
+```
+
+In POSIX, `GMT+07:00` means 7 hours **west** of Greenwich — that is `UTC-7`,
+the opposite sign from what was intended. Plugging that into the formulas
+(example: a UTC+7 zone, so `tz_offset_osd = 25200`):
+
+```
+folder = (-7) + (+7) = 0    ->  folder names in UTC          (wrong)
+OSD    =   0  + (+7) = +7   ->  on-screen time is local      (correct by luck)
+```
+
+The two errors cancel out for the OSD but not for the folder name.
+
+## The fix
+
+Restart `mp4record` with `TZ=UTC0` and **leave `tz_offset_osd` alone**:
+
+```
+folder = 0 + (+7) = +7   ->  local time  ✓
+OSD    = 0 + (+7) = +7   ->  unchanged   ✓
+```
+
+`sua_mp4record.sh` does this: it waits for `system.sh` to finish starting its
+own (broken) copy, kills every `mp4record`, and starts exactly one with
+`TZ=UTC0`. It is called from `/tmp/sd/yi-hack/startup.sh`, which `system.sh`
+runs automatically at the end of boot. Everything lives on the SD card, so it
+survives reboots and firmware upgrades.
+
+> **Do not** fix this by setting `tz_offset_osd` to `0` and using `TZ=ICT-7`
+> (or your equivalent). That also gives correct folder names, but it drags the
+> OSD along with it and your burned-in timestamps end up in UTC — which is far
+> worse, because unlike a folder name you cannot correct it afterwards.
+
+## Pitfall 1: duplicate `mp4record` processes corrupt recordings
+
+More than one thing starts `mp4record`:
+
+- Yi's own `watch_process`, which restarts it if it thinks it died
+  (inherits `TZ=GMT+07:00` from `system.sh`)
+- the CGI `camera_settings.sh?switch_on=yes`, used every time recording is
+  switched back on — by the mobile app, by an on/off schedule, or by your own
+  scripts. It inherits `TZ` from `httpd`, i.e. the contents of
+  `/home/yi-hack/etc/TZ`.
+
+If two of them resolve to the same offset they write into the **same folder**
+and overwrite each other's files. The result is `.mp4` files that are the
+expected size and open without error, but only decode **20-60% of the frames
+they claim to have**.
+
+That signature is easy to misread as a dying encoder chip. It is not — it is
+two writers in one directory. Check with:
+
+```sh
+ps | grep '[m]p4record'
+```
+
+Anything other than exactly one line is a problem.
+
+Because of this, `sua_mp4record.sh` is also registered as a cron job every
+5 minutes with `--canh` ("watch"): if exactly one process with the right `TZ`
+is running it exits immediately and does not disturb recording; it only cleans
+up when something is actually wrong.
+
+## Pitfall 2: `/etc/localtime` lives on the camera body, not the SD card
+
+If `/etc/TZ` and `/etc/localtime` exist, the system timezone is local rather
+than UTC, and the first formula becomes `OSD = (+7) + (+7) = +14`.
+
+These files are on the internal flash (jffs2), so they **stay with the camera
+body** when you move SD cards between cameras. If you have ever swapped
+hardware around, one camera can end up with them and another without, and the
+same configuration then behaves differently on each.
+
+Check before applying the fix:
+
+```sh
+date
+```
+
+If it prints `UTC`, you are fine. If it prints a local zone, remove
+`/etc/TZ` and `/etc/localtime` (back them up first) or your OSD will be off
+by one extra offset. The installer asks you about this.
+
+## Install
+
+Requires Python 3 and `paramiko` on your PC (`pip install paramiko`), and SSH
+enabled on the camera (yi-hack default: user `root`, empty password).
+
+```bash
+python deploy.py 192.168.1.99
+```
+
+On Windows you can double-click `run_deploy.bat`, which just asks for the IP.
+
+Then reboot the camera:
+
+```
+http://<camera-ip>/cgi-bin/reboot.sh
+```
+
+## Verify
+
+About two minutes after the reboot:
+
+```sh
+date                       # should print UTC
+date -u                    # actual UTC
+ls /tmp/sd/record | tail    # newest folder should match your LOCAL hour
+ps | grep '[m]p4record'    # exactly one process
+```
+
+Then pull the newest `.mp4` off the card and check that the burned-in timestamp
+matches the folder name plus the file name. All three must agree.
+
+## Uninstall
+
+Remove the line calling `sua_mp4record.sh` from `/tmp/sd/yi-hack/startup.sh`,
+remove the cron entry from `/var/spool/cron/crontabs/root`, and reboot.
+
+## Scope
+
+Tested on model `y203c`, app firmware `4.5.0.0C_201910080934`,
+yi-hack-MStar `0.5.7`, in a UTC+7 zone. The formulas are not zone-specific;
+`TZ=UTC0` is the correct value regardless of your offset, because the fix
+relies on `tz_offset_osd` (which `system.sh` already sets correctly for your
+zone) rather than on hard-coding an offset.
+
+Cameras running **yi-hack-v5** are a different codebase and do not have this
+bug — check `date` before assuming otherwise.
+
+## License
+
+MIT
