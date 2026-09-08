@@ -27,11 +27,19 @@ CRON_LINE = "*/5 * * * * /bin/sh /tmp/sd/yi-hack/scripts/sua_mp4record.sh --canh
 # middle silently breaks the registration - the cron job then quietly stops
 # coming back after a reboot, because /var/spool is tmpfs.
 CRON_BLOCK = (
-    "\n# Keep exactly one mp4record with the right TZ (watch_process and the\n"
-    "# camera_settings.sh CGI can start extra copies - see README).\n"
+    "\n# Keep exactly one mp4record with the right TZ - see README.\n"
     "mkdir -p /var/spool/cron/crontabs\n"
     f"grep -q 'sua_mp4record.sh --canh' /var/spool/cron/crontabs/root 2>/dev/null"
     f" || echo '{CRON_LINE}' >> /var/spool/cron/crontabs/root\n"
+    "\n"
+    "# busybox crond reads the crontabs ONCE when it starts and never rescans,\n"
+    "# and system.sh starts it (line 385) BEFORE it calls this file (line 395).\n"
+    "# Without this restart the cron line above is never loaded: it silently does\n"
+    "# nothing, every boot, forever. Measured: add a cron line and wait 80s -\n"
+    "# nothing runs; restart crond and it fires on the very next minute.\n"
+    "for p in $(ps | grep '[c]rond' | awk '{print $1}'); do kill \"$p\" 2>/dev/null; done\n"
+    "sleep 2\n"
+    "/usr/sbin/crond -c /var/spool/cron/crontabs/\n"
 )
 
 # See "Pitfall 3" in the README. Only applied if the gdrive add-on is present.
@@ -127,6 +135,11 @@ def deploy(ip):
     sh("mkdir -p /var/spool/cron/crontabs")
     sh(f"grep -q 'sua_mp4record.sh --canh' /var/spool/cron/crontabs/root 2>/dev/null "
        f"|| echo '{CRON_LINE}' >> /var/spool/cron/crontabs/root")
+
+    # The same crond restart, applied now instead of waiting for a reboot.
+    sh("for p in $(ps | grep '[c]rond' | awk '{print $1}'); do kill \"$p\" 2>/dev/null; done")
+    sh("sleep 2; /usr/sbin/crond -c /var/spool/cron/crontabs/")
+    print("  crond restarted, so the cron entry is actually loaded.")
 
     # 5. Warn about an older style of fix that fights this one
     if "set_tz_offset" in existing and "-v 0" in existing:

@@ -73,22 +73,34 @@ survives reboots and firmware upgrades.
 
 ## Pitfall 1: duplicate `mp4record` processes corrupt recordings
 
-More than one thing starts `mp4record`:
+The CGI `service.sh?name=mp4record&action=start` runs `./mp4record &` with **no
+check of any kind** — no "is one already running", no kill first. Upstream
+yi-hack-MStar 0.5.7, lines 466-474, unchanged in master. Call it n times and you
+get n recorders. `system.sh` has already started one at boot, so the very first
+call gives you two.
 
-- Yi's own `watch_process`, which restarts it if it thinks it died
-  (inherits `TZ=GMT+07:00` from `system.sh`)
-- the CGI `camera_settings.sh?switch_on=yes`, used every time recording is
-  switched back on — by the mobile app, by an on/off schedule, or by your own
-  scripts. It inherits `TZ` from `httpd`, i.e. the contents of
-  `/home/yi-hack/etc/TZ`.
+Callers cannot avoid it by asking first. `action=status` is `ps_program()`:
 
-If two of them resolve to the same offset they write into the **same folder**
-and overwrite each other's files. The result is `.mp4` files that are the
-expected size and open without error, but only decode **20-60% of the frames
-they claim to have**.
+```sh
+ps | grep $1 | grep -v grep | grep -c ^
+```
 
-That signature is easy to misread as a dying encoder chip. It is not — it is
-two writers in one directory. Check with:
+The command line of the CGI process asking the question contains `$1`, so it
+matches itself. Ask for the status of a program that does not exist and it still
+answers `started`. The only reliable sequence is `stop` (which is `killall`, so
+it is idempotent) and then `start`.
+
+Anything that switches recording back on goes through this: the Yi phone app, an
+on/off schedule, your own tooling.
+
+**Why one matters.** Every `mp4record` writes through the *same staging file*,
+`/tmp/sd/record/tmp.mp4.tmp`, and only renames it into the hour folder when the
+clip is finished. That path is identical no matter what `TZ` each process has or
+which folder it is aiming at. Two recorders are two H.264 streams interleaved
+into one file: full size, opens without error, decodes **20-60% of the frames it
+claims to have**. It looks exactly like a failing encoder chip. It is not.
+
+Check with:
 
 ```sh
 ps | grep '[m]p4record'
@@ -96,10 +108,16 @@ ps | grep '[m]p4record'
 
 Anything other than exactly one line is a problem.
 
-Because of this, `sua_mp4record.sh` is also registered as a cron job every
-5 minutes with `--canh` ("watch"): if exactly one process with the right `TZ`
-is running it exits immediately and does not disturb recording; it only cleans
-up when something is actually wrong.
+Because of this, `sua_mp4record.sh` is also registered as a cron job with
+`--canh` ("watch"): if exactly one process with the right `TZ` is running it
+exits immediately and does not disturb recording; it only cleans up when
+something is actually wrong. It costs about 0.4 s per run, so once a minute is
+reasonable on a camera that is switched on and off during the day.
+
+Two suspects that turned out to be innocent, in case you go looking for them:
+Yi's `watch_process` is not running on these cameras at all, and
+`camera_settings.sh?switch_on=yes` only calls `ipc_cmd -t on` — it does not
+launch a recorder itself.
 
 ## Pitfall 2: `/etc/localtime` lives on the camera body, not the SD card
 
@@ -158,6 +176,38 @@ Three things to know before you do:
   calls `startup.sh`. Start the uploader from a bare SSH session without them
   and every upload fails with `libssl.so.1.1: cannot open shared object file`,
   logged quietly to `log/GDriveUploader.log` while the process keeps looping.
+
+## Pitfall 4: your cron job never runs
+
+`sua_mp4record.sh --canh` is registered as a cron job. On a stock camera that
+job never executes, and nothing tells you.
+
+`busybox crond` reads the crontabs **once, when it starts**, and never rescans
+them. `system.sh` starts crond on line 385 and only calls
+`/tmp/sd/yi-hack/startup.sh` on line 395 - after. So any cron line written from
+`startup.sh` is registered into a file crond has already finished reading.
+
+Measured on a y203c: add a line to `/var/spool/cron/crontabs/root`, wait 80
+seconds, nothing runs. Restart crond and it fires on the very next minute.
+
+This bites anything you schedule from `startup.sh`, not just this fix.
+`/var/spool` is tmpfs as well, so the crontab itself is gone after a reboot and
+gets rewritten by `startup.sh` - into a crond that will not read it again.
+
+So `startup.sh` must restart crond after writing the crontab:
+
+```sh
+for p in $(ps | grep '[c]rond' | awk '{print $1}'); do kill "$p" 2>/dev/null; done
+sleep 2
+/usr/sbin/crond -c /var/spool/cron/crontabs/
+```
+
+`deploy.py` writes this for you. To check an existing camera:
+
+```sh
+echo '* * * * * date >> /tmp/moc.txt' >> /var/spool/cron/crontabs/root
+sleep 80; cat /tmp/moc.txt      # empty means crond is not reading your crontab
+```
 
 ## Install
 

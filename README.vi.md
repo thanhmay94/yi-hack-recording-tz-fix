@@ -73,20 +73,34 @@ firmware.
 
 ## Bẫy 1: nhiều tiến trình `mp4record` làm hỏng video
 
-Không chỉ `system.sh` khởi động `mp4record`. Còn có:
+CGI `service.sh?name=mp4record&action=start` chạy thẳng `./mp4record &` mà
+**không kiểm tra gì cả** — không hỏi đã có tiến trình nào chưa, không giết cái
+cũ. Bản gốc yi-hack-MStar 0.5.7 dòng 466-474, master hôm nay vẫn vậy. Gọi n lần
+ra n tiến trình. Mà `system.sh` đã bật sẵn một cái lúc khởi động, nên ngay lần
+gọi đầu tiên đã thành hai.
 
-- `watch_process` của Yi, tự khởi động lại nếu thấy nó chết
-  (thừa hưởng `TZ=GMT+07:00` từ `system.sh`)
-- CGI `camera_settings.sh?switch_on=yes`, chạy mỗi lần bật lại ghi hình — từ
-  app điện thoại, từ lịch bật/tắt, hoặc từ script của chính bạn. Nó thừa hưởng
-  `TZ` từ `httpd`, tức nội dung `/home/yi-hack/etc/TZ`.
+Hỏi trước cũng không được. `action=status` chính là hàm `ps_program()`:
 
-Nếu hai bản cùng ra một offset, chúng ghi vào **cùng một thư mục** và đè lên file
-của nhau. Kết quả là file `.mp4` đủ kích thước, mở được bình thường, nhưng chỉ
-giải mã được **20-60% số frame** mà nó khai báo.
+```sh
+ps | grep $1 | grep -v grep | grep -c ^
+```
 
-Triệu chứng này rất dễ bị chẩn đoán nhầm thành hỏng chip mã hoá. Không phải —
-đó là hai tiến trình cùng ghi một chỗ. Kiểm tra bằng:
+Dòng lệnh của chính tiến trình CGI đang hỏi có chứa `$1`, nên nó khớp với chính
+mình. Hỏi status của một chương trình không hề tồn tại cũng ra `started`. Cách
+duy nhất chắc chắn là `stop` (tức `killall`, gọi bao nhiêu lần cũng vậy) rồi mới
+`start`.
+
+Mọi thứ bật lại ghi hình đều đi qua đây: app Yi trên điện thoại, lịch bật/tắt,
+công cụ của chính bạn.
+
+**Vì sao phải đúng một.** Mọi `mp4record` đều ghi qua *cùng một file trung gian*
+`/tmp/sd/record/tmp.mp4.tmp`, xong clip mới đổi tên vào thư mục giờ. Đường dẫn đó
+giống hệt nhau bất kể mỗi tiến trình mang `TZ` gì hay nhắm vào thư mục nào. Hai
+tiến trình là hai luồng H.264 xen vào nhau trong một file: đủ kích thước, mở được
+bình thường, nhưng chỉ giải mã được **20-60% số frame** mà nó khai báo. Trông y
+hệt hỏng chip mã hoá. Không phải.
+
+Kiểm tra bằng:
 
 ```sh
 ps | grep '[m]p4record'
@@ -94,9 +108,15 @@ ps | grep '[m]p4record'
 
 Ra khác một dòng là có vấn đề.
 
-Vì vậy `sua_mp4record.sh` còn được đăng ký cron mỗi 5 phút với tham số `--canh`:
-nếu đang đúng (một bản, đúng `TZ`) thì thoát ngay không đụng đến việc ghi hình,
-chỉ dọn khi thật sự sai.
+Vì vậy `sua_mp4record.sh` còn được đăng ký cron với tham số `--canh`: nếu đang
+đúng (một bản, đúng `TZ`) thì thoát ngay không đụng đến việc ghi hình, chỉ dọn
+khi thật sự sai. Mỗi lần chạy tốn khoảng 0,4 giây, nên đặt mỗi phút là hợp lý
+với camera có bật tắt trong ngày.
+
+Hai nghi phạm hoá ra vô can, ghi lại để bạn khỏi mất công tìm: `watch_process`
+của Yi không hề chạy trên các camera này, còn
+`camera_settings.sh?switch_on=yes` chỉ gọi `ipc_cmd -t on` chứ không tự khởi
+động bản ghi hình nào.
 
 ## Bẫy 2: `/etc/localtime` nằm trên thân máy, không nằm trên thẻ SD
 
@@ -155,6 +175,38 @@ Ba điều phải biết trước khi làm:
   gọi `startup.sh`. Nếu bạn chạy uploader từ một phiên SSH trắng, mọi lần upload
   đều hỏng với `libssl.so.1.1: cannot open shared object file` — ghi lặng lẽ vào
   `log/GDriveUploader.log` trong khi tiến trình vẫn quay vòng như không có gì.
+
+## Bẫy 4: dòng cron của bạn không bao giờ chạy
+
+`sua_mp4record.sh --canh` được đăng ký dưới dạng cron. Trên camera nguyên bản,
+dòng cron đó **không chạy lần nào**, mà không có gì báo cho bạn biết.
+
+`busybox crond` đọc crontab **đúng một lần lúc nó khởi động**, sau đó không quét
+lại nữa. `system.sh` bật crond ở dòng 385, rồi mới gọi
+`/tmp/sd/yi-hack/startup.sh` ở dòng 395 — tức là sau. Nên mọi dòng cron ghi từ
+`startup.sh` đều rơi vào một file mà crond đã đọc xong từ trước.
+
+Đo trên y203c: thêm một dòng vào `/var/spool/cron/crontabs/root`, chờ 80 giây,
+không có gì chạy. Khởi động lại crond thì nó nổ ngay phút kế tiếp.
+
+Chuyện này ảnh hưởng tới mọi thứ bạn hẹn giờ từ `startup.sh`, không riêng bản vá
+này. `/var/spool` lại nằm trên tmpfs, nên sau mỗi lần reboot crontab mất sạch và
+được `startup.sh` ghi lại — vào một crond sẽ không đọc nó nữa.
+
+Vì vậy `startup.sh` phải khởi động lại crond sau khi ghi xong crontab:
+
+```sh
+for p in $(ps | grep '[c]rond' | awk '{print $1}'); do kill "$p" 2>/dev/null; done
+sleep 2
+/usr/sbin/crond -c /var/spool/cron/crontabs/
+```
+
+`deploy.py` tự ghi đoạn này. Muốn kiểm tra một camera đang chạy:
+
+```sh
+echo '* * * * * date >> /tmp/moc.txt' >> /var/spool/cron/crontabs/root
+sleep 80; cat /tmp/moc.txt      # trống nghĩa là crond không đọc crontab của bạn
+```
 
 ## Cài đặt
 
