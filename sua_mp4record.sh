@@ -48,16 +48,29 @@
 #
 # WHY THIS RUNS PERIODICALLY
 #
-#   Several things start additional mp4record processes:
-#     - Yi's own watch_process (inherits TZ=GMT+07:00 from system.sh)
-#     - the CGI camera_settings.sh?switch_on=yes, used whenever recording is
-#       switched back on - by the app, by a schedule, or by your own scripts.
-#       It inherits TZ from httpd, i.e. the contents of /home/yi-hack/etc/TZ.
+#   ONE thing starts extra recorders: the CGI
+#   service.sh?name=mp4record&action=start. It runs `./mp4record &` with no
+#   check at all (upstream yi-hack-MStar 0.5.7 lines 466-474, unchanged in
+#   master), so calling it n times gives you n recorders - and system.sh has
+#   already started one at boot. Anything that switches recording back on hits
+#   this: the Yi phone app, an on/off schedule, your own tooling.
 #
-#   Two processes whose TZ resolves to the same offset write into the SAME
-#   folder and overwrite each other's files. The result is truncated .mp4
-#   files that open fine but only decode 20-60% of their frames - which looks
-#   exactly like failing hardware. Keep exactly one process and it goes away.
+#   Callers cannot avoid it by asking first. service.sh?action=status is
+#   ps_program(), which is `ps | grep $1 | grep -v grep | grep -c ^` - and the
+#   command line of the CGI process asking the question contains "$1". Query
+#   the status of a program that does not exist and it still answers "started".
+#   The only reliable sequence is stop (killall, idempotent) then start.
+#
+#   Note camera_settings.sh?switch_on=yes does NOT start a recorder; it only
+#   runs `ipc_cmd -t on`. And Yi's watch_process is not running on these
+#   cameras at all - both were plausible suspects, neither is the cause.
+#
+#   Why one matters: every mp4record writes through the SAME staging file,
+#   /tmp/sd/record/tmp.mp4.tmp, and only then renames it into the hour folder.
+#   That path is identical no matter what TZ or target folder each process has.
+#   Two recorders are two H.264 streams interleaved into one file: full size,
+#   opens without error, decodes 20-60% of the frames it claims. It looks
+#   exactly like a failing encoder chip. It is not.
 #
 # USAGE
 #   sua_mp4record.sh          wait 60s (for system.sh to finish), then clean up.
@@ -103,9 +116,19 @@ liet_ke() {
 case "$1" in
     --ngay) ;;
     --canh)
-        # Exactly one process with the right TZ: leave recording alone.
         ds=$(liet_ke)
         so=$(echo "$ds" | grep -c .)
+
+        # No recorder at all: the camera was switched OFF on purpose - the yi
+        # app, a schedule, or your own tooling called
+        # service.sh?name=mp4record&action=stop. Starting one here would undo
+        # that and leave the camera recording all night. The periodic guard
+        # keeps ONE recorder correct; it does not decide whether to record.
+        if [ "$so" = "0" ]; then
+            exit 0
+        fi
+
+        # Exactly one process with the right TZ: leave recording alone.
         if [ "$so" = "1" ] && [ "${ds#* }" = "$TZ_DUNG" ]; then
             exit 0
         fi
