@@ -209,6 +209,37 @@ echo '* * * * * date >> /tmp/moc.txt' >> /var/spool/cron/crontabs/root
 sleep 80; cat /tmp/moc.txt      # empty means crond is not reading your crontab
 ```
 
+## Pitfall 5: killing `mp4record` at the wrong instant stops recording until reboot
+
+`mp4record` reads frames from a shared buffer guarded by the POSIX named
+semaphore `/dev/sem.fshare_read_lock` (a 16-byte file on tmpfs; byte 0 is the
+value, 1 = free, 0 = held). Kill a recorder while it holds that semaphore and
+the value stays 0 forever. Every recorder started afterwards hangs in
+`sem_wait` right after logging `fshare_open ok`: the process exists,
+`SWITCH_ON` is `yes`, RTSP still works, and not a single file is written.
+`/tmp/log.txt` fills with `rcd may crashed` and never shows `file begin record`.
+We lost 3.5 days of footage on one camera this way; only a reboot clears it.
+
+The window is tiny (300 reads over 10 s on a recording camera never saw 0), but
+this fix kills recorders several times a day (duplicates, wrong TZ), so across
+months and cameras it eventually lands.
+
+`sua_mp4record.sh` now defends in two layers:
+
+- **Prevent:** freeze the recorder with `SIGSTOP`, read the semaphore, and send
+  `SIGTERM` only if it is free. A frozen process cannot be holding it.
+  `SIGTERM` rather than `SIGKILL`, so mp4record still saves its partial minute.
+- **Repair:** every `--canh` run (each minute) checks the semaphore; six reads of
+  0 over ~2.5 s means nobody will release it, so it writes 1 back and restarts
+  the recorder. No reboot needed. Tested by writing 0 into the semaphore by hand:
+  recording stopped, the next cron run brought it back, under a minute lost.
+
+To check a camera by hand while it is recording:
+
+```sh
+dd if=/dev/sem.fshare_read_lock bs=1 count=1 2>/dev/null | hexdump -C   # 01 is normal
+```
+
 ## Install
 
 Requires Python 3 and `paramiko` on your PC (`pip install paramiko`), and SSH

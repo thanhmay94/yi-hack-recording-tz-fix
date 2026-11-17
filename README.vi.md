@@ -208,6 +208,40 @@ echo '* * * * * date >> /tmp/moc.txt' >> /var/spool/cron/crontabs/root
 sleep 80; cat /tmp/moc.txt      # trống nghĩa là crond không đọc crontab của bạn
 ```
 
+## Bẫy 5: giết `mp4record` sai lúc làm camera ngừng ghi đến tận lần reboot sau
+
+`mp4record` đọc khung hình từ một bộ đệm dùng chung. Bộ đệm này được canh bằng
+semaphore `/dev/sem.fshare_read_lock`, là một file 16 byte trên tmpfs, trong đó
+byte 0 cho biết trạng thái: 1 là rảnh, 0 là đang có tiến trình giữ. Nếu giết
+`mp4record` đúng lúc nó đang giữ semaphore, giá trị sẽ đứng ở 0 mãi. Mọi
+`mp4record` chạy sau đó đều treo ở `sem_wait`, ngay sau dòng log `fshare_open ok`.
+Lúc đó tiến trình vẫn còn, `SWITCH_ON` vẫn là `yes`, RTSP vẫn xem được, nhưng
+không có file nào được ghi. Trong `/tmp/log.txt`, dòng `rcd may crashed` lặp lại
+hàng trăm lần, còn `file begin record` thì không xuất hiện. Một camera của chúng
+tôi đã mất 3,5 ngày video như vậy, vì chỉ reboot mới xoá được semaphore.
+
+Lỗi hiếm gặp vì semaphore chỉ bị giữ trong vài micro giây: đọc 300 lần trong 10
+giây trên camera đang ghi, không lần nào thấy 0. Nhưng bản vá này giết
+`mp4record` mỗi khi có bản ghi chạy trùng hoặc chạy sai TZ, tức vài lần mỗi ngày.
+Cộng dồn qua nhiều tháng và nhiều camera thì sớm muộn cũng trúng đúng lúc.
+
+`sua_mp4record.sh` chống lỗi này bằng hai lớp:
+
+- **Phòng:** đóng băng tiến trình bằng `SIGSTOP`, đọc semaphore, và chỉ gửi
+  `SIGTERM` khi semaphore đang rảnh. Tiến trình đang bị đóng băng thì không thể
+  đang giữ semaphore. Dùng `SIGTERM` chứ không dùng `SIGKILL`, để `mp4record` còn
+  kịp lưu phút video đang ghi dở.
+- **Chữa:** mỗi lần chạy `--canh` (mỗi phút), nếu semaphore đọc ra 0 liên tục 6
+  lần trong khoảng 2,5 giây, script ghi lại giá trị 1 rồi khởi động lại bộ ghi.
+  Cách này không cần reboot. Đã thử bằng cách tự ghi 0 vào semaphore: camera ngừng
+  ghi, đến lượt cron kế tiếp thì ghi lại, mất chưa đến một phút video.
+
+Kiểm tra tay trên một camera đang bật ghi:
+
+```sh
+dd if=/dev/sem.fshare_read_lock bs=1 count=1 2>/dev/null | hexdump -C   # 01 là bình thường
+```
+
 ## Cài đặt
 
 Cần Python 3 và `paramiko` trên PC (`pip install paramiko`), và camera đã bật

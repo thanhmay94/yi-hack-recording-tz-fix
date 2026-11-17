@@ -78,6 +78,25 @@
 #   sua_mp4record.sh --ngay   clean up immediately.
 #   sua_mp4record.sh --canh   only clean up IF NEEDED. Safe to run from cron:
 #                             it does not interrupt recording when all is well.
+#
+# THE STUCK LOCK (found 2026-11-18)
+#
+#   mp4record reads frames from a shared buffer guarded by the POSIX named
+#   semaphore /dev/sem.fshare_read_lock (16-byte file on tmpfs; byte 0 is the
+#   value: 1 = free, 0 = held). Killing a recorder at the instant it holds that
+#   semaphore leaves it at 0 forever. Every recorder started afterwards blocks
+#   in sem_wait (wchan futex_wait_queue_me) right after logging
+#   "fshare_open ok": the process exists, SWITCH_ON is yes, RTSP still works,
+#   but not a single file is written - until the camera reboots. One camera
+#   lost 3.5 days of footage this way.
+#
+#   Two defences here:
+#   - dung_an_toan: freeze the recorder (SIGSTOP), and only send SIGTERM if the
+#     semaphore is free at that moment - a frozen process cannot be holding it.
+#     SIGTERM (not SIGKILL) so mp4record still saves its partial minute.
+#   - khoa_ket / mo_khoa: the lock is held for microseconds (300 reads over
+#     10 s on a recording camera: never 0). Six reads of 0 over 2.5 s means
+#     nobody will ever release it, so write 1 back and restart the recorder.
 # ---------------------------------------------------------------------------
 
 CHO_BAN_DAU=60          # wait for system.sh to start its own copy first
@@ -113,9 +132,62 @@ liet_ke() {
     done
 }
 
+KHOA=/dev/sem.fshare_read_lock
+
+# Byte 0 of the semaphore: 1 = free, 0 = held.
+gia_tri_khoa() {
+    dd if="$KHOA" bs=1 count=1 2>/dev/null | hexdump -e '1/1 "%u"'
+}
+
+# True only if the lock reads 0 six times over ~2.5 s. Returns after ONE read
+# when the lock is free, which is the normal case - cheap enough for cron.
+khoa_ket() {
+    [ -e "$KHOA" ] || return 1
+    i=0
+    while [ $i -lt 6 ]; do
+        [ "$(gia_tri_khoa)" = "0" ] || return 1
+        i=$((i + 1))
+        usleep 500000
+    done
+    return 0
+}
+
+# Put the semaphore back to "free". Waiters already asleep are not woken by
+# this, which is why the callers restart the recorder afterwards.
+mo_khoa() {
+    echo -ne '\001' | dd of="$KHOA" bs=1 count=1 conv=notrunc 2>/dev/null
+}
+
+# Stop one recorder at a moment it is not holding the lock (see above).
+dung_an_toan() {
+    lan=0
+    while [ $lan -lt 20 ]; do
+        kill -STOP "$1" 2>/dev/null || return 0     # already gone
+        if [ "$(gia_tri_khoa)" != "0" ]; then
+            kill -TERM "$1" 2>/dev/null
+            kill -CONT "$1" 2>/dev/null
+            return 0
+        fi
+        kill -CONT "$1" 2>/dev/null
+        usleep 100000
+        lan=$((lan + 1))
+    done
+    # Lock busy for 2 s straight: stop anyway, the check after restart repairs it.
+    echo "  lock busy for 2s, stopping $1 anyway"
+    kill -TERM "$1" 2>/dev/null
+}
+
 case "$1" in
     --ngay) ;;
     --canh)
+        if khoa_ket; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') read lock stuck at 0 -> reset to 1" >> "$LOG"
+            mo_khoa
+            # A recorder already asleep on the lock stays asleep: restart it
+            # (falls through to the cleanup below). No recorder = recording is
+            # off on purpose, leave it off.
+            [ -n "$(liet_ke)" ] || exit 0
+        else
         ds=$(liet_ke)
         so=$(echo "$ds" | grep -c .)
 
@@ -132,15 +204,15 @@ case "$1" in
         if [ "$so" = "1" ] && [ "${ds#* }" = "$TZ_DUNG" ]; then
             exit 0
         fi
+        fi
         ;;
     *) sleep "$CHO_BAN_DAU" ;;
 esac
 
-{
-    echo "$(date '+%Y-%m-%d %H:%M:%S') === cleaning up mp4record ($1) ==="
+khoi_dong_lai() {
     liet_ke | while read pid tz; do
         echo "  kill $pid (TZ=$tz)"
-        kill "$pid" 2>/dev/null
+        dung_an_toan "$pid"
     done
 
     sleep 3
@@ -153,6 +225,18 @@ esac
     liet_ke | while read pid tz; do
         echo "  running $pid (TZ=$tz)"
     done
+}
+
+{
+    echo "$(date '+%Y-%m-%d %H:%M:%S') === cleaning up mp4record ($1) ==="
+    khoi_dong_lai
+    # The kill above may still have hit the lock (SIGTERM handler, or the
+    # 2 s fallback). Check once and repair right away instead of a minute later.
+    if khoa_ket; then
+        echo "  read lock stuck at 0 after restart -> reset to 1, restart again"
+        mo_khoa
+        khoi_dong_lai
+    fi
 } >> "$LOG" 2>&1
 
 # Trim the log
